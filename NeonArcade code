@@ -1,0 +1,2397 @@
+Action: file_editor create /app/backend/.env --file-text "MONGO_URL=\"mongodb://localhost:27017\"
+DB_NAME=\"test_database\"
+CORS_ORIGINS=\"*\"
+JWT_SECRET=\"5d481934846c7e1c7f5db03e8d9f9b1ac40d3e7d3d4028cc04fa97b0d0b65195\"
+ADMIN_EMAIL=\"admin@neonarcade.io\"
+ADMIN_PASSWORD=\"admin123\"
+FRONTEND_URL=\"https://game-hub-2253.preview.emergentagent.com\"
+EMERGENT_LLM_KEY=\"sk-emergent-e09D8B1FfEf23B5A4E\"
+"
+Observation: Overwrite successful: /app/backend/.env
+
+Action: file_editor create /app/memory/test_credentials.md --file-text "# Test Credentials
+
+## Admin
+- email: admin@neonarcade.io
+- password: admin123
+- role: admin
+
+## Test User (create via register endpoint)
+- email: player@neonarcade.io
+- password: player123
+- role: user
+
+## Auth Endpoints
+- POST /api/auth/register  { name, email, password }
+- POST /api/auth/login     { email, password }
+- POST /api/auth/logout
+- GET  /api/auth/me
+- POST /api/auth/refresh
+
+## Game Endpoints
+- GET  /api/games                       (list of available games)
+- POST /api/scores                      (submit score, auth required)
+- GET  /api/leaderboard/{game_id}       (top 20)
+- GET  /api/me/scores                   (current user history, auth)
+- POST /api/ai/chat                     (AI assistant, auth required)
+"
+Observation: Overwrite successful: /app/memory/test_credentials.md
+
+Action: file_editor create /app/backend/server.py --file-text "from dotenv import load_dotenv
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / \".env\")
+
+import os
+import logging
+import uuid
+import bcrypt
+import jwt
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional
+
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, EmailStr
+
+from emergentintegrations.llm.chat import LlmChat, UserMessage
+
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO, format=\"%(asctime)s - %(name)s - %(levelname)s - %(message)s\")
+logger = logging.getLogger(\"neonarcade\")
+
+
+# ---------- DB ----------
+mongo_url = os.environ[\"MONGO_URL\"]
+mongo_client = AsyncIOMotorClient(mongo_url)
+db = mongo_client[os.environ[\"DB_NAME\"]]
+
+
+# ---------- Auth utils ----------
+JWT_ALGORITHM = \"HS256\"
+
+
+def get_jwt_secret() -> str:
+    return os.environ[\"JWT_SECRET\"]
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(\"utf-8\"), bcrypt.gensalt()).decode(\"utf-8\")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode(\"utf-8\"), hashed.encode(\"utf-8\"))
+    except Exception:
+        return False
+
+
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {
+        \"sub\": user_id,
+        \"email\": email,
+        \"exp\": datetime.now(timezone.utc) + timedelta(minutes=60 * 24),
+        \"type\": \"access\",
+    }
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+
+def create_refresh_token(user_id: str) -> str:
+    payload = {
+        \"sub\": user_id,
+        \"exp\": datetime.now(timezone.utc) + timedelta(days=7),
+        \"type\": \"refresh\",
+    }
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+
+def set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    response.set_cookie(\"access_token\", access_token, httponly=True, secure=True,
+                        samesite=\"none\", max_age=60 * 60 * 24, path=\"/\")
+    response.set_cookie(\"refresh_token\", refresh_token, httponly=True, secure=True,
+                        samesite=\"none\", max_age=60 * 60 * 24 * 7, path=\"/\")
+
+
+def clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(\"access_token\", path=\"/\")
+    response.delete_cookie(\"refresh_token\", path=\"/\")
+
+
+async def get_current_user(request: Request) -> dict:
+    token = request.cookies.get(\"access_token\")
+    if not token:
+        auth_header = request.headers.get(\"Authorization\", \"\")
+        if auth_header.startswith(\"Bearer \"):
+            token = auth_header[7:]
+    if not token:
+        raise HTTPException(status_code=401, detail=\"Not authenticated\")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get(\"type\") != \"access\":
+            raise HTTPException(status_code=401, detail=\"Invalid token type\")
+        user = await db.users.find_one({\"id\": payload[\"sub\"]}, {\"_id\": 0, \"password_hash\": 0})
+        if not user:
+            raise HTTPException(status_code=401, detail=\"User not found\")
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail=\"Token expired\")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail=\"Invalid token\")
+
+
+# ---------- Models ----------
+class RegisterIn(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    email: EmailStr
+    password: str = Field(min_length=6, max_length=128)
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserOut(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    avatar: Optional[str] = None
+    role: str = \"user\"
+    created_at: str
+
+
+class ScoreIn(BaseModel):
+    game_id: str
+    score: int = Field(ge=0)
+    duration_sec: Optional[float] = None
+
+
+class ScoreOut(BaseModel):
+    id: str
+    user_id: str
+    user_name: str
+    game_id: str
+    score: int
+    duration_sec: Optional[float] = None
+    created_at: str
+
+
+class ChatIn(BaseModel):
+    game_id: Optional[str] = None
+    session_id: Optional[str] = None
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class ChatOut(BaseModel):
+    session_id: str
+    reply: str
+
+
+# ---------- Games metadata ----------
+GAMES = [
+    {\"id\": \"tic-tac-toe\", \"name\": \"Tic Tac Toe\", \"tagline\": \"Outsmart the grid\", \"score_label\": \"Wins\"},
+    {\"id\": \"snake\", \"name\": \"Neon Snake\", \"tagline\": \"Devour the dots\", \"score_label\": \"Length\"},
+    {\"id\": \"memory\", \"name\": \"Memory Matrix\", \"tagline\": \"Match the pairs\", \"score_label\": \"Points\"},
+    {\"id\": \"2048\", \"name\": \"2048\", \"tagline\": \"Merge to victory\", \"score_label\": \"Tile Score\"},
+    {\"id\": \"rps\", \"name\": \"Rock Paper Scissors\", \"tagline\": \"Best the AI\", \"score_label\": \"Win Streak\"},
+    {\"id\": \"reaction\", \"name\": \"Reaction Time\", \"tagline\": \"Lightning reflexes\", \"score_label\": \"ms (lower = better)\"},
+]
+GAME_IDS = {g[\"id\"] for g in GAMES}
+
+
+# ---------- App ----------
+app = FastAPI()
+api = APIRouter(prefix=\"/api\")
+
+
+# ---------- Auth Endpoints ----------
+@api.post(\"/auth/register\", response_model=UserOut)
+async def register(body: RegisterIn, response: Response):
+    email = body.email.lower().strip()
+    existing = await db.users.find_one({\"email\": email})
+    if existing:
+        raise HTTPException(status_code=400, detail=\"Email already registered\")
+    user_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        \"id\": user_id,
+        \"name\": body.name.strip(),
+        \"email\": email,
+        \"password_hash\": hash_password(body.password),
+        \"role\": \"user\",
+        \"avatar\": None,
+        \"created_at\": now,
+    }
+    await db.users.insert_one(doc)
+    access = create_access_token(user_id, email)
+    refresh = create_refresh_token(user_id)
+    set_auth_cookies(response, access, refresh)
+    return UserOut(id=user_id, name=doc[\"name\"], email=email, role=\"user\", avatar=None, created_at=now)
+
+
+@api.post(\"/auth/login\", response_model=UserOut)
+async def login(body: LoginIn, response: Response):
+    email = body.email.lower().strip()
+    user = await db.users.find_one({\"email\": email})
+    if not user or not verify_password(body.password, user[\"password_hash\"]):
+        raise HTTPException(status_code=401, detail=\"Invalid email or password\")
+    access = create_access_token(user[\"id\"], email)
+    refresh = create_refresh_token(user[\"id\"])
+    set_auth_cookies(response, access, refresh)
+    return UserOut(
+        id=user[\"id\"], name=user[\"name\"], email=user[\"email\"],
+        avatar=user.get(\"avatar\"), role=user.get(\"role\", \"user\"),
+        created_at=user[\"created_at\"],
+    )
+
+
+@api.post(\"/auth/logout\")
+async def logout(response: Response, _user: dict = Depends(get_current_user)):
+    clear_auth_cookies(response)
+    return {\"ok\": True}
+
+
+@api.get(\"/auth/me\", response_model=UserOut)
+async def me(user: dict = Depends(get_current_user)):
+    return UserOut(**{k: user.get(k) for k in [\"id\", \"name\", \"email\", \"avatar\", \"role\", \"created_at\"]})
+
+
+@api.post(\"/auth/refresh\")
+async def refresh_token(request: Request, response: Response):
+    token = request.cookies.get(\"refresh_token\")
+    if not token:
+        raise HTTPException(status_code=401, detail=\"No refresh token\")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get(\"type\") != \"refresh\":
+            raise HTTPException(status_code=401, detail=\"Invalid token type\")
+        user = await db.users.find_one({\"id\": payload[\"sub\"]})
+        if not user:
+            raise HTTPException(status_code=401, detail=\"User not found\")
+        access = create_access_token(user[\"id\"], user[\"email\"])
+        response.set_cookie(\"access_token\", access, httponly=True, secure=True,
+                            samesite=\"none\", max_age=60 * 60 * 24, path=\"/\")
+        return {\"ok\": True}
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail=\"Invalid refresh token\")
+
+
+# ---------- Games / Scores ----------
+@api.get(\"/games\")
+async def list_games():
+    return GAMES
+
+
+def _better(game_id: str, a: int, b: int) -> bool:
+    # For reaction time, lower is better
+    if game_id == \"reaction\":
+        return a < b
+    return a > b
+
+
+@api.post(\"/scores\", response_model=ScoreOut)
+async def submit_score(body: ScoreIn, user: dict = Depends(get_current_user)):
+    if body.game_id not in GAME_IDS:
+        raise HTTPException(status_code=400, detail=\"Unknown game\")
+    score_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        \"id\": score_id,
+        \"user_id\": user[\"id\"],
+        \"user_name\": user[\"name\"],
+        \"game_id\": body.game_id,
+        \"score\": int(body.score),
+        \"duration_sec\": body.duration_sec,
+        \"created_at\": now,
+    }
+    await db.scores.insert_one(doc)
+
+    # Update personal best
+    pb = await db.personal_bests.find_one({\"user_id\": user[\"id\"], \"game_id\": body.game_id})
+    if pb is None or _better(body.game_id, body.score, pb[\"score\"]):
+        await db.personal_bests.update_one(
+            {\"user_id\": user[\"id\"], \"game_id\": body.game_id},
+            {\"$set\": {
+                \"user_id\": user[\"id\"], \"user_name\": user[\"name\"],
+                \"game_id\": body.game_id, \"score\": body.score, \"updated_at\": now,
+            }},
+            upsert=True,
+        )
+    return ScoreOut(**{k: doc[k] for k in [\"id\", \"user_id\", \"user_name\", \"game_id\", \"score\", \"duration_sec\", \"created_at\"]})
+
+
+@api.get(\"/leaderboard/{game_id}\")
+async def leaderboard(game_id: str, limit: int = 20):
+    if game_id not in GAME_IDS:
+        raise HTTPException(status_code=404, detail=\"Unknown game\")
+    sort_dir = 1 if game_id == \"reaction\" else -1
+    rows = await db.personal_bests.find(
+        {\"game_id\": game_id}, {\"_id\": 0}
+    ).sort(\"score\", sort_dir).limit(limit).to_list(limit)
+    return rows
+
+
+@api.get(\"/me/scores\")
+async def my_scores(user: dict = Depends(get_current_user)):
+    rows = await db.scores.find(
+        {\"user_id\": user[\"id\"]}, {\"_id\": 0}
+    ).sort(\"created_at\", -1).limit(50).to_list(50)
+    bests = await db.personal_bests.find(
+        {\"user_id\": user[\"id\"]}, {\"_id\": 0}
+    ).to_list(100)
+    return {\"recent\": rows, \"personal_bests\": bests}
+
+
+# ---------- AI Assistant ----------
+def _system_prompt(game_id: Optional[str]) -> str:
+    base = (
+        \"You are NEON, the in-house AI assistant for the Neon Arcade gaming hub. \"
+        \"You give punchy, friendly tips, strategy hints and trivia for classic browser mini-games \"
+        \"(Tic Tac Toe, Snake, Memory Matrix, 2048, Rock Paper Scissors, Reaction Time). \"
+        \"Keep replies short (max 5 sentences), upbeat, and never reveal you are an AI model brand. \"
+        \"Use light cyberpunk vibe in tone.\"
+    )
+    if game_id:
+        base += f\" The user is currently playing: {game_id}.\"
+    return base
+
+
+@api.post(\"/ai/chat\", response_model=ChatOut)
+async def ai_chat(body: ChatIn, user: dict = Depends(get_current_user)):
+    api_key = os.environ.get(\"EMERGENT_LLM_KEY\")
+    if not api_key:
+        raise HTTPException(status_code=500, detail=\"AI not configured\")
+    session_id = body.session_id or f\"{user['id']}:{body.game_id or 'general'}\"
+    try:
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=session_id,
+            system_message=_system_prompt(body.game_id),
+        ).with_model(\"anthropic\", \"claude-sonnet-4-5-20250929\")
+        msg = UserMessage(text=body.message)
+        reply = await chat.send_message(msg)
+
+        await db.chat_messages.insert_one({
+            \"id\": str(uuid.uuid4()),
+            \"user_id\": user[\"id\"],
+            \"session_id\": session_id,
+            \"game_id\": body.game_id,
+            \"user_message\": body.message,
+            \"assistant_reply\": reply,
+            \"created_at\": datetime.now(timezone.utc).isoformat(),
+        })
+        return ChatOut(session_id=session_id, reply=str(reply))
+    except Exception as e:
+        logger.exception(\"AI chat failed\")
+        raise HTTPException(status_code=500, detail=f\"AI error: {e}\")
+
+
+# ---------- Health ----------
+@api.get(\"/\")
+async def root():
+    return {\"ok\": True, \"service\": \"neon-arcade\"}
+
+
+# ---------- Startup ----------
+@app.on_event(\"startup\")
+async def on_startup():
+    await db.users.create_index(\"email\", unique=True)
+    await db.users.create_index(\"id\", unique=True)
+    await db.scores.create_index([(\"game_id\", 1), (\"score\", -1)])
+    await db.scores.create_index(\"user_id\")
+    await db.personal_bests.create_index([(\"user_id\", 1), (\"game_id\", 1)], unique=True)
+    await db.personal_bests.create_index([(\"game_id\", 1), (\"score\", -1)])
+
+    admin_email = os.environ.get(\"ADMIN_EMAIL\", \"admin@neonarcade.io\").lower()
+    admin_password = os.environ.get(\"ADMIN_PASSWORD\", \"admin123\")
+    existing = await db.users.find_one({\"email\": admin_email})
+    if existing is None:
+        await db.users.insert_one({
+            \"id\": str(uuid.uuid4()),
+            \"name\": \"Admin\",
+            \"email\": admin_email,
+            \"password_hash\": hash_password(admin_password),
+            \"role\": \"admin\",
+            \"avatar\": None,
+            \"created_at\": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info(\"Seeded admin user %s\", admin_email)
+    elif not verify_password(admin_password, existing[\"password_hash\"]):
+        await db.users.update_one(
+            {\"email\": admin_email},
+            {\"$set\": {\"password_hash\": hash_password(admin_password)}},
+        )
+        logger.info(\"Admin password updated for %s\", admin_email)
+
+
+@app.on_event(\"shutdown\")
+async def on_shutdown():
+    mongo_client.close()
+
+
+# ---------- Wire app ----------
+app.include_router(api)
+
+frontend_url = os.environ.get(\"FRONTEND_URL\")
+cors_origins = [frontend_url] if frontend_url else os.environ.get(\"CORS_ORIGINS\", \"*\").split(\",\")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=[\"*\"],
+    allow_headers=[\"*\"],
+)
+"
+Observation: Overwrite successful: /app/backend/server.py
+
+Action: file_editor create /app/frontend/src/index.css --file-text "@import url(\"https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;700;800;900&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap\");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-void: #050505;
+  --bg-surface: #0c0c0e;
+  --bg-elevated: #151518;
+  --text-primary: #f5f7fa;
+  --text-secondary: #a1a1aa;
+  --accent-yellow: #fee715;
+  --accent-cyan: #00f0ff;
+  --accent-green: #00ff41;
+  --border-default: #1f2937;
+}
+
+html, body, #root {
+  background-color: var(--bg-void);
+  color: var(--text-primary);
+  font-family: \"JetBrains Mono\", ui-monospace, SFMono-Regular, monospace;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-image:
+    radial-gradient(ellipse at top left, rgba(0, 240, 255, 0.06), transparent 50%),
+    radial-gradient(ellipse at bottom right, rgba(254, 231, 21, 0.05), transparent 50%),
+    linear-gradient(180deg, #050505 0%, #050505 100%);
+  background-attachment: fixed;
+}
+
+::selection {
+  background: rgba(0, 240, 255, 0.35);
+  color: #050505;
+}
+
+/* terminal grid backdrop helper */
+.grid-bg {
+  background-image:
+    linear-gradient(to right, rgba(31, 41, 55, 0.35) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(31, 41, 55, 0.35) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+.font-heading { font-family: \"Unbounded\", sans-serif; letter-spacing: -0.02em; }
+.font-mono { font-family: \"JetBrains Mono\", monospace; }
+
+.glow-cyan { box-shadow: 0 0 24px rgba(0, 240, 255, 0.25); }
+.glow-yellow { box-shadow: 0 0 24px rgba(254, 231, 21, 0.3); }
+.glow-green { box-shadow: 0 0 24px rgba(0, 255, 65, 0.25); }
+
+.scanlines::before {
+  content: \"\";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.02) 0px,
+    rgba(255, 255, 255, 0.02) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  mix-blend-mode: overlay;
+}
+
+@keyframes flicker {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.85; }
+}
+
+.neon-text-cyan {
+  color: var(--accent-cyan);
+  text-shadow: 0 0 8px rgba(0, 240, 255, 0.6), 0 0 18px rgba(0, 240, 255, 0.3);
+}
+.neon-text-yellow {
+  color: var(--accent-yellow);
+  text-shadow: 0 0 8px rgba(254, 231, 21, 0.55), 0 0 18px rgba(254, 231, 21, 0.25);
+}
+.neon-text-green {
+  color: var(--accent-green);
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.55), 0 0 18px rgba(0, 255, 65, 0.25);
+}
+
+.btn-primary {
+  background: var(--accent-yellow);
+  color: #050505;
+  font-family: \"Unbounded\", sans-serif;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 0.75rem 1.5rem;
+  border: 0;
+  transition: all 0.2s ease;
+}
+.btn-primary:hover { box-shadow: 0 0 24px rgba(254, 231, 21, 0.5); transform: translateY(-1px); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-outline-cyan {
+  background: transparent;
+  border: 1px solid var(--accent-cyan);
+  color: var(--accent-cyan);
+  font-family: \"Unbounded\", sans-serif;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 0.75rem 1.5rem;
+  transition: all 0.2s ease;
+}
+.btn-outline-cyan:hover {
+  background: rgba(0, 240, 255, 0.1);
+  box-shadow: 0 0 24px rgba(0, 240, 255, 0.35);
+}
+
+.card-neon {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  transition: all 0.3s ease;
+}
+.card-neon:hover {
+  border-color: var(--accent-cyan);
+  box-shadow: 0 0 22px rgba(0, 240, 255, 0.18);
+  transform: translateY(-4px);
+}
+
+.input-neon {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  padding: 0.75rem 1rem;
+  font-family: \"JetBrains Mono\", monospace;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  width: 100%;
+}
+.input-neon:focus {
+  border-color: var(--accent-cyan);
+  outline: none;
+  box-shadow: 0 0 0 1px var(--accent-cyan);
+}
+
+.label-neon {
+  font-family: \"Unbounded\", sans-serif;
+  font-size: 0.7rem;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+}
+
+.divider-corner {
+  position: relative;
+}
+.divider-corner::before,
+.divider-corner::after {
+  content: \"\";
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--accent-cyan);
+}
+.divider-corner::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
+.divider-corner::after  { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
+
+@keyframes boot-in {
+  0% { opacity: 0; transform: translateY(10px); filter: blur(6px); }
+  100% { opacity: 1; transform: translateY(0); filter: blur(0); }
+}
+.boot-in { animation: boot-in 0.5s ease forwards; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #0a0a0c; }
+::-webkit-scrollbar-thumb { background: #1f2937; border-radius: 0; }
+::-webkit-scrollbar-thumb:hover { background: #00f0ff; }
+"
+Observation: Overwrite successful: /app/frontend/src/index.css
+
+Action: file_editor create /app/frontend/src/App.css --file-text ".App { min-height: 100vh; background: #050505; }
+"
+Observation: Overwrite successful: /app/frontend/src/App.css
+
+Action: file_editor create /app/frontend/src/api.js --file-text "import axios from \"axios\";
+
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+export const API_BASE = `${BACKEND_URL}/api`;
+
+const api = axios.create({
+  baseURL: API_BASE,
+  withCredentials: true,
+});
+
+export function formatApiError(detail) {
+  if (detail == null) return \"Something went wrong. Please try again.\";
+  if (typeof detail === \"string\") return detail;
+  if (Array.isArray(detail))
+    return detail
+      .map((e) => (e && typeof e.msg === \"string\" ? e.msg : JSON.stringify(e)))
+      .filter(Boolean)
+      .join(\" \");
+  if (detail && typeof detail.msg === \"string\") return detail.msg;
+  return String(detail);
+}
+
+export default api;
+"
+Observation: Create successful: /app/frontend/src/api.js
+
+Action: file_editor create /app/frontend/src/contexts/AuthContext.jsx --file-text "import { createContext, useContext, useEffect, useState, useCallback } from \"react\";
+import api, { formatApiError } from \"../api\";
+
+const AuthContext = createContext(null);
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null); // null=loading, false=not auth, object=user
+  const [error, setError] = useState(\"\");
+
+  const fetchMe = useCallback(async () => {
+    try {
+      const { data } = await api.get(\"/auth/me\");
+      setUser(data);
+    } catch {
+      setUser(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchMe();
+  }, [fetchMe]);
+
+  const login = async (email, password) => {
+    setError(\"\");
+    try {
+      const { data } = await api.post(\"/auth/login\", { email, password });
+      setUser(data);
+      return true;
+    } catch (e) {
+      setError(formatApiError(e.response?.data?.detail) || e.message);
+      return false;
+    }
+  };
+
+  const register = async (name, email, password) => {
+    setError(\"\");
+    try {
+      const { data } = await api.post(\"/auth/register\", { name, email, password });
+      setUser(data);
+      return true;
+    } catch (e) {
+      setError(formatApiError(e.response?.data?.detail) || e.message);
+      return false;
+    }
+  };
+
+  const logout = async () => {
+    try {
+      await api.post(\"/auth/logout\");
+    } catch {
+      /* ignore */
+    }
+    setUser(false);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, login, register, logout, error, setError }}>
+      {children}
+    </AuthContext.Provider>
+  );
+};
+
+export const useAuth = () => useContext(AuthContext);
+"
+Observation: Create successful: /app/frontend/src/contexts/AuthContext.jsx
+
+Action: file_editor create /app/frontend/src/components/Layout.jsx --file-text "import { Link, NavLink, useLocation } from \"react-router-dom\";
+import { Gamepad2, Trophy, User, LogOut, LogIn, Terminal } from \"lucide-react\";
+import { useAuth } from \"../contexts/AuthContext\";
+import AiChat from \"./AiChat\";
+
+const NavItem = ({ to, children }) => (
+  <NavLink
+    to={to}
+    data-testid={`nav-link-${to.replace(\"/\", \"\") || \"home\"}`}
+    className={({ isActive }) =>
+      `px-3 py-2 text-xs tracking-[0.2em] uppercase font-bold transition-colors ${
+        isActive ? \"text-[#00F0FF]\" : \"text-zinc-400 hover:text-white\"
+      }`
+    }
+  >
+    {children}
+  </NavLink>
+);
+
+const Layout = ({ children }) => {
+  const { user, logout } = useAuth();
+  const location = useLocation();
+  const showChat = user && user !== null && user !== false && !location.pathname.startsWith(\"/login\") && !location.pathname.startsWith(\"/register\");
+
+  return (
+    <div className=\"min-h-screen flex flex-col\">
+      <header className=\"fixed top-0 inset-x-0 z-50 backdrop-blur-xl bg-black/70 border-b border-[#1F2937]/80\">
+        <div className=\"max-w-7xl mx-auto flex items-center justify-between px-4 sm:px-6 lg:px-8 h-16\">
+          <Link to=\"/\" className=\"flex items-center gap-2\" data-testid=\"brand-logo\">
+            <Terminal className=\"w-5 h-5 text-[#FEE715]\" />
+            <span className=\"font-heading font-black tracking-tighter text-xl\">
+              NEON<span className=\"neon-text-cyan\">ARCADE</span>
+            </span>
+          </Link>
+
+          <nav className=\"hidden md:flex items-center gap-1\">
+            <NavItem to=\"/\">Home</NavItem>
+            <NavItem to=\"/play\">Games</NavItem>
+            <NavItem to=\"/leaderboards\">Leaderboards</NavItem>
+            {user && user !== false && <NavItem to=\"/profile\">Profile</NavItem>}
+          </nav>
+
+          <div className=\"flex items-center gap-2\">
+            {user && user !== false ? (
+              <>
+                <span className=\"hidden sm:inline-block text-xs text-zinc-400\" data-testid=\"nav-user-name\">
+                  <span className=\"text-[#00FF41]\">●</span> {user.name}
+                </span>
+                <button
+                  data-testid=\"logout-button\"
+                  onClick={logout}
+                  className=\"btn-outline-cyan text-xs px-3 py-2 inline-flex items-center gap-1\"
+                >
+                  <LogOut className=\"w-3.5 h-3.5\" /> Logout
+                </button>
+              </>
+            ) : user === false ? (
+              <>
+                <Link to=\"/login\" data-testid=\"nav-login-link\" className=\"btn-outline-cyan text-xs px-3 py-2 inline-flex items-center gap-1\">
+                  <LogIn className=\"w-3.5 h-3.5\" /> Login
+                </Link>
+                <Link to=\"/register\" data-testid=\"nav-register-link\" className=\"btn-primary text-xs px-3 py-2 hidden sm:inline-block\">
+                  Sign Up
+                </Link>
+              </>
+            ) : null}
+          </div>
+        </div>
+      </header>
+
+      <main className=\"pt-16 flex-1\">{children}</main>
+
+      <footer className=\"border-t border-[#1F2937] py-8 mt-16\">
+        <div className=\"max-w-7xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-4\">
+          <div className=\"flex items-center gap-2 text-xs text-zinc-500\">
+            <Gamepad2 className=\"w-4 h-4\" />
+            <span>NEON_ARCADE // SYS.0.1 // ALL_SYSTEMS_OPERATIONAL</span>
+          </div>
+          <div className=\"flex items-center gap-4 text-xs text-zinc-500\">
+            <Trophy className=\"w-4 h-4 text-[#FEE715]\" />
+            <User className=\"w-4 h-4 text-[#00F0FF]\" />
+            <Terminal className=\"w-4 h-4 text-[#00FF41]\" />
+          </div>
+        </div>
+      </footer>
+
+      {showChat && <AiChat />}
+    </div>
+  );
+};
+
+export default Layout;
+"
+Observation: Create successful: /app/frontend/src/components/Layout.jsx
+
+Action: file_editor create /app/frontend/src/components/AiChat.jsx --file-text "import { useState, useRef, useEffect } from \"react\";
+import { Bot, X, Send, Sparkles } from \"lucide-react\";
+import api, { formatApiError } from \"../api\";
+
+const SUGGESTED = [
+  \"Tip for winning Tic Tac Toe?\",
+  \"How do I get a 2048 tile fast?\",
+  \"What's the best Snake strategy?\",
+];
+
+const AiChat = () => {
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState([
+    { role: \"assistant\", text: \"Hey, I'm NEON. Ask me for tips on any game in the arcade.\" },
+  ]);
+  const [input, setInput] = useState(\"\");
+  const [busy, setBusy] = useState(false);
+  const [sessionId, setSessionId] = useState(null);
+  const endRef = useRef(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: \"smooth\" });
+  }, [messages, open]);
+
+  const send = async (text) => {
+    const message = (text ?? input).trim();
+    if (!message || busy) return;
+    setInput(\"\");
+    setMessages((m) => [...m, { role: \"user\", text: message }]);
+    setBusy(true);
+    try {
+      const { data } = await api.post(\"/ai/chat\", { message, session_id: sessionId });
+      if (!sessionId) setSessionId(data.session_id);
+      setMessages((m) => [...m, { role: \"assistant\", text: data.reply }]);
+    } catch (e) {
+      setMessages((m) => [
+        ...m,
+        { role: \"assistant\", text: `[error] ${formatApiError(e.response?.data?.detail) || e.message}` },
+      ]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        data-testid=\"ai-chat-toggle\"
+        onClick={() => setOpen((v) => !v)}
+        className=\"fixed bottom-6 right-6 z-40 w-14 h-14 flex items-center justify-center bg-[#FEE715] text-black rounded-none border border-[#FEE715] hover:shadow-[0_0_28px_rgba(254,231,21,0.6)] transition-all\"
+        aria-label=\"Open AI assistant\"
+      >
+        {open ? <X className=\"w-6 h-6\" /> : <Bot className=\"w-6 h-6\" />}
+      </button>
+
+      {open && (
+        <div
+          data-testid=\"ai-chat-panel\"
+          className=\"fixed bottom-24 right-6 z-40 w-[92vw] sm:w-[400px] max-h-[70vh] flex flex-col bg-[#0C0C0E] border border-[#1F2937] divider-corner\"
+        >
+          <div className=\"flex items-center justify-between px-4 py-3 border-b border-[#1F2937]\">
+            <div className=\"flex items-center gap-2\">
+              <Sparkles className=\"w-4 h-4 text-[#00F0FF]\" />
+              <span className=\"font-heading font-bold tracking-tight\">NEON_ASSISTANT</span>
+            </div>
+            <span className=\"text-[10px] uppercase tracking-[0.2em] text-[#00FF41]\">● ONLINE</span>
+          </div>
+
+          <div className=\"flex-1 overflow-y-auto p-4 space-y-3 text-sm\">
+            {messages.map((m, i) => (
+              <div
+                key={i}
+                className={`flex ${m.role === \"user\" ? \"justify-end\" : \"justify-start\"}`}
+              >
+                <div
+                  data-testid={`chat-msg-${m.role}`}
+                  className={`max-w-[85%] px-3 py-2 ${
+                    m.role === \"user\"
+                      ? \"bg-[#00F0FF]/10 border border-[#00F0FF]/40 text-white\"
+                      : \"bg-[#151518] border border-[#1F2937] text-zinc-200\"
+                  }`}
+                >
+                  {m.text}
+                </div>
+              </div>
+            ))}
+            {busy && (
+              <div className=\"text-xs text-zinc-500 animate-pulse\">NEON is thinking…</div>
+            )}
+            <div ref={endRef} />
+          </div>
+
+          {messages.length <= 1 && (
+            <div className=\"px-4 pb-2 flex flex-wrap gap-2\">
+              {SUGGESTED.map((s) => (
+                <button
+                  key={s}
+                  data-testid={`chat-suggest-${s.slice(0, 6)}`}
+                  onClick={() => send(s)}
+                  className=\"text-[10px] uppercase tracking-wider px-2 py-1 border border-[#1F2937] hover:border-[#00F0FF] text-zinc-400 hover:text-[#00F0FF] transition-colors\"
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              send();
+            }}
+            className=\"flex border-t border-[#1F2937]\"
+          >
+            <input
+              data-testid=\"ai-chat-input\"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder=\"Ask for a tip…\"
+              className=\"flex-1 bg-transparent px-4 py-3 text-sm outline-none placeholder:text-zinc-600\"
+            />
+            <button
+              data-testid=\"ai-chat-send\"
+              type=\"submit\"
+              disabled={busy}
+              className=\"px-4 bg-[#00F0FF] text-black disabled:opacity-40\"
+            >
+              <Send className=\"w-4 h-4\" />
+            </button>
+          </form>
+        </div>
+      )}
+    </>
+  );
+};
+
+export default AiChat;
+"
+Observation: Create successful: /app/frontend/src/components/AiChat.jsx
+
+Action: file_editor create /app/frontend/src/components/ProtectedRoute.jsx --file-text "import { Navigate } from \"react-router-dom\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const ProtectedRoute = ({ children }) => {
+  const { user } = useAuth();
+  if (user === null) {
+    return (
+      <div className=\"min-h-[60vh] flex items-center justify-center text-zinc-500\">
+        Booting session…
+      </div>
+    );
+  }
+  if (user === false) return <Navigate to=\"/login\" replace />;
+  return children;
+};
+
+export default ProtectedRoute;
+"
+Observation: Create successful: /app/frontend/src/components/ProtectedRoute.jsx
+
+Action: file_editor create /app/frontend/src/pages/Home.jsx --file-text "import { useEffect, useState } from \"react\";
+import { Link } from \"react-router-dom\";
+import { ChevronRight, Zap, Trophy, Cpu } from \"lucide-react\";
+import api from \"../api\";
+
+const HERO_BG = \"https://static.prod-images.emergentagent.com/jobs/21518bb8-730d-476f-adc8-cc8a9d002784/images/3f94304ad2ba9579c3b2b50a0d07b6ede388cc1c176dac5c841bbb1a1a293e72.png\";
+
+const ACCENT_BY_INDEX = [\"text-[#00F0FF]\", \"text-[#FEE715]\", \"text-[#00FF41]\"];
+
+const Home = () => {
+  const [games, setGames] = useState([]);
+  const [topReaction, setTopReaction] = useState([]);
+
+  useEffect(() => {
+    api.get(\"/games\").then((r) => setGames(r.data)).catch(() => setGames([]));
+    api.get(\"/leaderboard/reaction\").then((r) => setTopReaction(r.data)).catch(() => {});
+  }, []);
+
+  return (
+    <>
+      {/* HERO */}
+      <section className=\"relative overflow-hidden\">
+        <div
+          className=\"absolute inset-0 bg-cover bg-center opacity-50\"
+          style={{ backgroundImage: `url(${HERO_BG})` }}
+        />
+        <div className=\"absolute inset-0 bg-gradient-to-t from-[#050505] via-[#050505]/85 to-transparent\" />
+        <div className=\"absolute inset-0 grid-bg opacity-30\" />
+
+        <div className=\"relative max-w-7xl mx-auto px-6 lg:px-8 py-24 lg:py-40\">
+          <div className=\"max-w-3xl boot-in\">
+            <div className=\"label-neon mb-6\">// SYS.BOOT // PLAY.EXE LOADED</div>
+            <h1 className=\"font-heading font-black text-5xl sm:text-6xl lg:text-7xl tracking-tighter leading-[0.95]\">
+              ENTER THE
+              <br />
+              <span className=\"neon-text-yellow\">NEON ARCADE</span>
+              <span className=\"neon-text-cyan\">.</span>
+            </h1>
+            <p className=\"mt-6 text-zinc-400 text-base sm:text-lg max-w-xl leading-relaxed\">
+              Six handcrafted browser mini-games. Live leaderboards. An AI co-pilot that whispers strategy
+              in your ear. Plug in &mdash; the grid is hungry.
+            </p>
+
+            <div className=\"mt-10 flex flex-wrap gap-3\">
+              <Link to=\"/play\" data-testid=\"hero-play-btn\" className=\"btn-primary inline-flex items-center gap-2\">
+                Launch Arcade <ChevronRight className=\"w-4 h-4\" />
+              </Link>
+              <Link to=\"/leaderboards\" data-testid=\"hero-leaderboard-btn\" className=\"btn-outline-cyan inline-flex items-center gap-2\">
+                <Trophy className=\"w-4 h-4\" /> Leaderboards
+              </Link>
+            </div>
+
+            <div className=\"mt-16 grid grid-cols-3 gap-8 max-w-xl\">
+              {[
+                { label: \"GAMES_ACTIVE\", value: \"06\", Icon: Zap, color: \"text-[#FEE715]\" },
+                { label: \"LIVE_BOARDS\", value: \"06\", Icon: Trophy, color: \"text-[#00F0FF]\" },
+                { label: \"AI_CO_PILOT\", value: \"01\", Icon: Cpu, color: \"text-[#00FF41]\" },
+              ].map(({ label, value, Icon, color }) => (
+                <div key={label} className=\"border-l border-[#1F2937] pl-4\">
+                  <Icon className={`w-4 h-4 ${color}`} />
+                  <div className={`mt-2 font-heading text-3xl font-black ${color}`}>{value}</div>
+                  <div className=\"text-[10px] tracking-[0.2em] text-zinc-500 mt-1\">{label}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* GAMES GRID */}
+      <section className=\"relative py-20 max-w-7xl mx-auto px-6 lg:px-8\">
+        <div className=\"flex items-end justify-between mb-10\">
+          <div>
+            <div className=\"label-neon mb-2\">// THE_ROSTER</div>
+            <h2 className=\"font-heading font-bold text-3xl sm:text-4xl tracking-tight\">Pick your weapon.</h2>
+          </div>
+          <Link to=\"/play\" className=\"hidden sm:inline-flex items-center gap-1 text-xs uppercase tracking-[0.2em] text-zinc-400 hover:text-[#00F0FF]\">
+            All games <ChevronRight className=\"w-4 h-4\" />
+          </Link>
+        </div>
+
+        <div className=\"grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6\">
+          {games.map((g, i) => (
+            <Link
+              to={`/play/${g.id}`}
+              key={g.id}
+              data-testid={`game-card-${g.id}`}
+              className=\"card-neon group p-6 flex flex-col gap-4 divider-corner relative overflow-hidden\"
+              style={{ animationDelay: `${i * 60}ms` }}
+            >
+              <div className=\"absolute -right-4 -top-4 font-heading font-black text-6xl text-[#1F2937] group-hover:text-[#0F1F2F] transition-colors\">
+                0{i + 1}
+              </div>
+              <div className={`text-[10px] tracking-[0.25em] uppercase ${ACCENT_BY_INDEX[i % 3]}`}>
+                {g.score_label}
+              </div>
+              <h3 className=\"font-heading font-bold text-2xl\">{g.name}</h3>
+              <p className=\"text-sm text-zinc-500\">{g.tagline}</p>
+              <div className=\"mt-auto flex items-center justify-between text-xs\">
+                <span className=\"text-zinc-500\">[ READY ]</span>
+                <span className=\"text-[#00F0FF] group-hover:translate-x-1 transition-transform inline-flex items-center gap-1\">
+                  PLAY <ChevronRight className=\"w-3 h-3\" />
+                </span>
+              </div>
+            </Link>
+          ))}
+        </div>
+      </section>
+
+      {/* MINI LEADERBOARD */}
+      <section className=\"relative py-16 max-w-7xl mx-auto px-6 lg:px-8\">
+        <div className=\"grid lg:grid-cols-2 gap-8 items-start\">
+          <div>
+            <div className=\"label-neon mb-2\">// AI_CO_PILOT</div>
+            <h2 className=\"font-heading font-bold text-3xl sm:text-4xl tracking-tight\">Talk to NEON.</h2>
+            <p className=\"mt-4 text-zinc-400 max-w-md\">
+              Stuck on a level? Open the chat in the bottom-right and ask. NEON returns short, sharp tips
+              calibrated to whatever game you're playing.
+            </p>
+            <Link to=\"/play\" className=\"mt-6 inline-flex btn-outline-cyan items-center gap-2\">
+              Start a Game <ChevronRight className=\"w-4 h-4\" />
+            </Link>
+          </div>
+
+          <div className=\"card-neon p-6 divider-corner\">
+            <div className=\"flex items-center justify-between mb-4\">
+              <div className=\"label-neon\">// LIVE_BOARD</div>
+              <span className=\"text-xs text-zinc-500\">REACTION_TIME</span>
+            </div>
+            {topReaction.length === 0 ? (
+              <div className=\"text-zinc-500 text-sm py-6 text-center\">
+                No champions yet. Be the first to set the record.
+              </div>
+            ) : (
+              <ol className=\"space-y-2\">
+                {topReaction.slice(0, 5).map((row, i) => (
+                  <li key={row.user_id} className=\"flex items-center justify-between border-b border-[#1F2937] py-2 last:border-0\">
+                    <span className=\"flex items-center gap-3\">
+                      <span className=\"font-heading font-black text-lg text-[#FEE715] w-6\">
+                        {String(i + 1).padStart(2, \"0\")}
+                      </span>
+                      <span>{row.user_name}</span>
+                    </span>
+                    <span className=\"text-[#00F0FF] font-mono\">{row.score} ms</span>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+        </div>
+      </section>
+    </>
+  );
+};
+
+export default Home;
+"
+Observation: Create successful: /app/frontend/src/pages/Home.jsx
+
+Action: file_editor create /app/frontend/src/pages/Login.jsx --file-text "import { useState } from \"react\";
+import { Link, useNavigate } from \"react-router-dom\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const Login = () => {
+  const { login, error } = useAuth();
+  const [email, setEmail] = useState(\"\");
+  const [password, setPassword] = useState(\"\");
+  const [submitting, setSubmitting] = useState(false);
+  const nav = useNavigate();
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    const ok = await login(email, password);
+    setSubmitting(false);
+    if (ok) nav(\"/\");
+  };
+
+  return (
+    <div className=\"min-h-[80vh] flex items-center justify-center px-4\">
+      <div className=\"w-full max-w-md card-neon p-8 divider-corner relative\">
+        <div className=\"label-neon mb-3\">// AUTH.LOGIN</div>
+        <h1 className=\"font-heading font-black text-3xl tracking-tighter mb-6\">
+          Plug back <span className=\"neon-text-cyan\">in</span>.
+        </h1>
+
+        <form onSubmit={submit} className=\"space-y-4\">
+          <div>
+            <label className=\"label-neon block mb-2\">Email</label>
+            <input
+              data-testid=\"login-email-input\"
+              type=\"email\"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className=\"input-neon\"
+              placeholder=\"player@neonarcade.io\"
+              autoComplete=\"email\"
+            />
+          </div>
+          <div>
+            <label className=\"label-neon block mb-2\">Password</label>
+            <input
+              data-testid=\"login-password-input\"
+              type=\"password\"
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className=\"input-neon\"
+              placeholder=\"••••••••\"
+              autoComplete=\"current-password\"
+            />
+          </div>
+
+          {error && (
+            <div data-testid=\"login-error\" className=\"text-xs text-red-400 border border-red-500/30 px-3 py-2\">
+              {error}
+            </div>
+          )}
+
+          <button
+            data-testid=\"login-submit-button\"
+            type=\"submit\"
+            disabled={submitting}
+            className=\"btn-primary w-full\"
+          >
+            {submitting ? \"Connecting…\" : \"Enter Arcade\"}
+          </button>
+        </form>
+
+        <div className=\"mt-6 text-xs text-zinc-500 text-center\">
+          New operator?{\" \"}
+          <Link to=\"/register\" data-testid=\"login-go-register\" className=\"text-[#00F0FF] hover:text-white\">
+            Create an account
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Login;
+"
+Observation: Create successful: /app/frontend/src/pages/Login.jsx
+
+Action: file_editor create /app/frontend/src/pages/Register.jsx --file-text "import { useState } from \"react\";
+import { Link, useNavigate } from \"react-router-dom\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const Register = () => {
+  const { register, error } = useAuth();
+  const [name, setName] = useState(\"\");
+  const [email, setEmail] = useState(\"\");
+  const [password, setPassword] = useState(\"\");
+  const [submitting, setSubmitting] = useState(false);
+  const nav = useNavigate();
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    const ok = await register(name, email, password);
+    setSubmitting(false);
+    if (ok) nav(\"/\");
+  };
+
+  return (
+    <div className=\"min-h-[80vh] flex items-center justify-center px-4\">
+      <div className=\"w-full max-w-md card-neon p-8 divider-corner relative\">
+        <div className=\"label-neon mb-3\">// AUTH.REGISTER</div>
+        <h1 className=\"font-heading font-black text-3xl tracking-tighter mb-6\">
+          Boot a <span className=\"neon-text-yellow\">new identity</span>.
+        </h1>
+
+        <form onSubmit={submit} className=\"space-y-4\">
+          <div>
+            <label className=\"label-neon block mb-2\">Handle</label>
+            <input
+              data-testid=\"register-name-input\"
+              type=\"text\"
+              required
+              maxLength={40}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className=\"input-neon\"
+              placeholder=\"xX_PixelRunner_Xx\"
+            />
+          </div>
+          <div>
+            <label className=\"label-neon block mb-2\">Email</label>
+            <input
+              data-testid=\"register-email-input\"
+              type=\"email\"
+              required
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className=\"input-neon\"
+              placeholder=\"ops@grid.io\"
+              autoComplete=\"email\"
+            />
+          </div>
+          <div>
+            <label className=\"label-neon block mb-2\">Password</label>
+            <input
+              data-testid=\"register-password-input\"
+              type=\"password\"
+              required
+              minLength={6}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className=\"input-neon\"
+              placeholder=\"6+ characters\"
+              autoComplete=\"new-password\"
+            />
+          </div>
+
+          {error && (
+            <div data-testid=\"register-error\" className=\"text-xs text-red-400 border border-red-500/30 px-3 py-2\">
+              {error}
+            </div>
+          )}
+
+          <button
+            data-testid=\"register-submit-button\"
+            type=\"submit\"
+            disabled={submitting}
+            className=\"btn-primary w-full\"
+          >
+            {submitting ? \"Spinning up…\" : \"Initialize\"}
+          </button>
+        </form>
+
+        <div className=\"mt-6 text-xs text-zinc-500 text-center\">
+          Already on the grid?{\" \"}
+          <Link to=\"/login\" data-testid=\"register-go-login\" className=\"text-[#00F0FF] hover:text-white\">
+            Login
+          </Link>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Register;
+"
+Observation: Create successful: /app/frontend/src/pages/Register.jsx
+Action: file_editor create /app/frontend/src/pages/Profile.jsx --file-text "import { useEffect, useState } from \"react\";
+import api from \"../api\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const GAME_NAMES = {
+  \"tic-tac-toe\": \"Tic Tac Toe\",
+  \"snake\": \"Neon Snake\",
+  \"memory\": \"Memory Matrix\",
+  \"2048\": \"2048\",
+  \"rps\": \"Rock Paper Scissors\",
+  \"reaction\": \"Reaction Time\",
+};
+
+const Profile = () => {
+  const { user } = useAuth();
+  const [recent, setRecent] = useState([]);
+  const [bests, setBests] = useState([]);
+
+  useEffect(() => {
+    api.get(\"/me/scores\").then((r) => {
+      setRecent(r.data.recent || []);
+      setBests(r.data.personal_bests || []);
+    });
+  }, []);
+
+  if (!user || user === false) return null;
+
+  return (
+    <div className=\"max-w-7xl mx-auto px-6 lg:px-8 py-16\">
+      <div className=\"card-neon p-8 divider-corner mb-10\">
+        <div className=\"label-neon mb-3\">// PROFILE</div>
+        <div className=\"flex flex-col sm:flex-row sm:items-end justify-between gap-4\">
+          <div>
+            <h1 className=\"font-heading font-black text-4xl tracking-tighter\">
+              {user.name}
+            </h1>
+            <p className=\"text-sm text-zinc-500 mt-1\">{user.email}</p>
+          </div>
+          <div className=\"text-right text-xs text-zinc-500\">
+            <div>JOINED</div>
+            <div className=\"text-[#00F0FF]\">{new Date(user.created_at).toLocaleDateString()}</div>
+          </div>
+        </div>
+      </div>
+
+      <div className=\"grid lg:grid-cols-2 gap-6\">
+        <div className=\"card-neon p-6 divider-corner\">
+          <div className=\"label-neon mb-4\">// PERSONAL_BESTS</div>
+          {bests.length === 0 ? (
+            <p className=\"text-zinc-500 text-sm\">No bests yet. Go play something.</p>
+          ) : (
+            <ul className=\"space-y-2\" data-testid=\"personal-bests-list\">
+              {bests.map((b) => (
+                <li key={b.game_id} className=\"flex justify-between border-b border-[#1F2937] py-2 last:border-0\">
+                  <span>{GAME_NAMES[b.game_id] || b.game_id}</span>
+                  <span className=\"text-[#FEE715] font-mono\">{b.score}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div className=\"card-neon p-6 divider-corner\">
+          <div className=\"label-neon mb-4\">// RECENT_RUNS</div>
+          {recent.length === 0 ? (
+            <p className=\"text-zinc-500 text-sm\">No runs yet.</p>
+          ) : (
+            <ul className=\"space-y-2 max-h-[420px] overflow-y-auto\" data-testid=\"recent-scores-list\">
+              {recent.map((r) => (
+                <li key={r.id} className=\"flex justify-between border-b border-[#1F2937] py-2 last:border-0 text-sm\">
+                  <span>
+                    <span className=\"text-zinc-500 mr-2\">
+                      {new Date(r.created_at).toLocaleString()}
+                    </span>
+                    {GAME_NAMES[r.game_id] || r.game_id}
+                  </span>
+                  <span className=\"text-[#00F0FF] font-mono\">{r.score}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Profile;
+"
+Observation: Create successful: /app/frontend/src/pages/Profile.jsx
+
+Action: file_editor create /app/frontend/src/pages/Leaderboards.jsx --file-text "import { useEffect, useState } from \"react\";
+import api from \"../api\";
+
+const GAMES = [
+  { id: \"tic-tac-toe\", name: \"Tic Tac Toe\", unit: \"wins\" },
+  { id: \"snake\", name: \"Neon Snake\", unit: \"length\" },
+  { id: \"memory\", name: \"Memory Matrix\", unit: \"points\" },
+  { id: \"2048\", name: \"2048\", unit: \"score\" },
+  { id: \"rps\", name: \"Rock Paper Scissors\", unit: \"streak\" },
+  { id: \"reaction\", name: \"Reaction Time\", unit: \"ms\" },
+];
+
+const Leaderboards = () => {
+  const [active, setActive] = useState(GAMES[0].id);
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    setLoading(true);
+    api
+      .get(`/leaderboard/${active}`)
+      .then((r) => setRows(r.data))
+      .catch(() => setRows([]))
+      .finally(() => setLoading(false));
+  }, [active]);
+
+  const activeMeta = GAMES.find((g) => g.id === active);
+
+  return (
+    <div className=\"max-w-7xl mx-auto px-6 lg:px-8 py-16\">
+      <div className=\"label-neon mb-2\">// LEADERBOARDS</div>
+      <h1 className=\"font-heading font-black text-4xl sm:text-5xl tracking-tighter\">
+        Hall of <span className=\"neon-text-yellow\">Champions</span>.
+      </h1>
+
+      <div className=\"mt-10 flex flex-wrap gap-2\">
+        {GAMES.map((g) => (
+          <button
+            key={g.id}
+            data-testid={`leaderboard-tab-${g.id}`}
+            onClick={() => setActive(g.id)}
+            className={`px-4 py-2 text-xs uppercase tracking-[0.2em] font-bold border transition-colors ${
+              active === g.id
+                ? \"border-[#00F0FF] text-[#00F0FF] bg-[#00F0FF]/5\"
+                : \"border-[#1F2937] text-zinc-400 hover:text-white hover:border-zinc-500\"
+            }`}
+          >
+            {g.name}
+          </button>
+        ))}
+      </div>
+
+      <div className=\"mt-8 card-neon p-6 divider-corner\">
+        {loading ? (
+          <div className=\"py-12 text-center text-zinc-500\">Loading…</div>
+        ) : rows.length === 0 ? (
+          <div className=\"py-12 text-center text-zinc-500\">
+            No scores submitted yet. Be the first.
+          </div>
+        ) : (
+          <table className=\"w-full\" data-testid=\"leaderboard-table\">
+            <thead>
+              <tr className=\"text-[10px] tracking-[0.25em] uppercase text-zinc-500 border-b border-[#1F2937]\">
+                <th className=\"text-left py-3 w-12\">#</th>
+                <th className=\"text-left py-3\">Operator</th>
+                <th className=\"text-right py-3\">{activeMeta?.unit}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr
+                  key={r.user_id}
+                  className=\"border-b border-[#1F2937] last:border-0 hover:bg-[#0F1115] transition-colors\"
+                >
+                  <td className=\"py-3 font-heading font-black text-lg\">
+                    <span className={i === 0 ? \"text-[#FEE715]\" : i === 1 ? \"text-[#00F0FF]\" : i === 2 ? \"text-[#00FF41]\" : \"text-zinc-500\"}>
+                      {String(i + 1).padStart(2, \"0\")}
+                    </span>
+                  </td>
+                  <td className=\"py-3\">{r.user_name}</td>
+                  <td className=\"py-3 text-right text-[#00F0FF] font-mono\">{r.score}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default Leaderboards;
+"
+Observation: Create successful: /app/frontend/src/pages/Leaderboards.jsx
+
+Action: file_editor create /app/frontend/src/pages/Play.jsx --file-text "import { useParams, Link } from \"react-router-dom\";
+import { ChevronLeft } from \"lucide-react\";
+import { useEffect, useState } from \"react\";
+import api from \"../api\";
+
+import TicTacToe from \"../games/TicTacToe\";
+import Snake from \"../games/Snake\";
+import Memory from \"../games/Memory\";
+import Game2048 from \"../games/Game2048\";
+import RPS from \"../games/RPS\";
+import Reaction from \"../games/Reaction\";
+
+const GAME_MAP = {
+  \"tic-tac-toe\": TicTacToe,
+  \"snake\": Snake,
+  \"memory\": Memory,
+  \"2048\": Game2048,
+  \"rps\": RPS,
+  \"reaction\": Reaction,
+};
+
+const Play = () => {
+  const { gameId } = useParams();
+  const [games, setGames] = useState([]);
+  const [leaderboard, setLeaderboard] = useState([]);
+
+  useEffect(() => {
+    api.get(\"/games\").then((r) => setGames(r.data));
+  }, []);
+
+  useEffect(() => {
+    if (gameId && GAME_MAP[gameId]) {
+      api.get(`/leaderboard/${gameId}`).then((r) => setLeaderboard(r.data)).catch(() => setLeaderboard([]));
+    }
+  }, [gameId]);
+
+  const reloadLeaderboard = () => {
+    if (gameId) api.get(`/leaderboard/${gameId}`).then((r) => setLeaderboard(r.data)).catch(() => {});
+  };
+
+  if (!gameId) {
+    return (
+      <div className=\"max-w-7xl mx-auto px-6 py-16\">
+        <div className=\"label-neon mb-2\">// ARCADE</div>
+        <h1 className=\"font-heading font-black text-4xl sm:text-5xl tracking-tighter mb-10\">
+          Pick your <span className=\"neon-text-cyan\">game</span>.
+        </h1>
+        <div className=\"grid sm:grid-cols-2 lg:grid-cols-3 gap-6\">
+          {games.map((g, i) => (
+            <Link
+              key={g.id}
+              to={`/play/${g.id}`}
+              data-testid={`play-card-${g.id}`}
+              className=\"card-neon p-6 divider-corner relative overflow-hidden\"
+            >
+              <div className=\"absolute -right-3 -top-2 font-heading font-black text-5xl text-[#151820]\">
+                0{i + 1}
+              </div>
+              <div className=\"text-[10px] tracking-[0.25em] uppercase text-[#00F0FF]\">{g.score_label}</div>
+              <h2 className=\"font-heading font-bold text-2xl mt-2\">{g.name}</h2>
+              <p className=\"text-sm text-zinc-500 mt-2\">{g.tagline}</p>
+            </Link>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const Game = GAME_MAP[gameId];
+  if (!Game)
+    return (
+      <div className=\"max-w-3xl mx-auto px-6 py-16 text-center\">
+        <h1 className=\"font-heading font-bold text-2xl\">Unknown game.</h1>
+        <Link to=\"/play\" className=\"text-[#00F0FF] mt-4 inline-block\">Back</Link>
+      </div>
+    );
+
+  const gameMeta = games.find((g) => g.id === gameId);
+
+  return (
+    <div className=\"max-w-7xl mx-auto px-6 lg:px-8 py-12\">
+      <Link to=\"/play\" className=\"inline-flex items-center gap-1 text-xs uppercase tracking-[0.2em] text-zinc-400 hover:text-[#00F0FF] mb-6\">
+        <ChevronLeft className=\"w-3 h-3\" /> All Games
+      </Link>
+
+      <div className=\"grid lg:grid-cols-[1fr_320px] gap-8 items-start\">
+        <div>
+          <div className=\"label-neon mb-2\">// {gameId.toUpperCase()}</div>
+          <h1 className=\"font-heading font-black text-3xl sm:text-4xl tracking-tighter mb-6\">
+            {gameMeta?.name || gameId}
+          </h1>
+          <Game onScoreSubmitted={reloadLeaderboard} />
+        </div>
+
+        <aside className=\"card-neon p-6 divider-corner sticky top-24\">
+          <div className=\"label-neon mb-4\">// TOP_10</div>
+          {leaderboard.length === 0 ? (
+            <p className=\"text-zinc-500 text-sm\">No scores yet. Be #01.</p>
+          ) : (
+            <ol className=\"space-y-2 text-sm\" data-testid=\"game-leaderboard\">
+              {leaderboard.slice(0, 10).map((row, i) => (
+                <li key={row.user_id} className=\"flex justify-between border-b border-[#1F2937] py-1.5 last:border-0\">
+                  <span className=\"flex items-center gap-2\">
+                    <span className=\"font-heading font-black text-[#FEE715] w-5\">
+                      {String(i + 1).padStart(2, \"0\")}
+                    </span>
+                    <span className=\"truncate max-w-[140px]\">{row.user_name}</span>
+                  </span>
+                  <span className=\"text-[#00F0FF] font-mono\">{row.score}</span>
+                </li>
+              ))}
+            </ol>
+          )}
+        </aside>
+      </div>
+    </div>
+  );
+};
+
+export default Play;
+"
+Observation: Create successful: /app/frontend/src/pages/Play.jsx
+
+Action: file_editor create /app/frontend/src/games/_scoreUtils.js --file-text "import api from \"../api\";
+import { useState } from \"react\";
+import { toast } from \"sonner\";
+
+export const submitScore = async (game_id, score, duration_sec = null) => {
+  try {
+    await api.post(\"/scores\", { game_id, score, duration_sec });
+    toast.success(`Score submitted: ${score}`);
+    return true;
+  } catch (e) {
+    if (e.response?.status === 401) {
+      toast.error(\"Login to submit scores.\");
+    } else {
+      toast.error(\"Could not submit score.\");
+    }
+    return false;
+  }
+};
+
+export const useScoreSubmit = (gameId, onScoreSubmitted) => {
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async (score, duration_sec = null) => {
+    setSubmitting(true);
+    const ok = await submitScore(gameId, score, duration_sec);
+    setSubmitting(false);
+    if (ok && onScoreSubmitted) onScoreSubmitted();
+    return ok;
+  };
+  return { submit, submitting };
+};
+"
+Observation: Create successful: /app/frontend/src/games/_scoreUtils.js
+Now create all 6 game components in parallel:
+Action: file_editor create /app/frontend/src/games/TicTacToe.jsx --file-text "import { useEffect, useState } from \"react\";
+import { useScoreSubmit } from \"./_scoreUtils\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const LINES = [
+  [0, 1, 2], [3, 4, 5], [6, 7, 8],
+  [0, 3, 6], [1, 4, 7], [2, 5, 8],
+  [0, 4, 8], [2, 4, 6],
+];
+
+const winnerOf = (b) => {
+  for (const [a, c, d] of LINES) if (b[a] && b[a] === b[c] && b[a] === b[d]) return { player: b[a], line: [a, c, d] };
+  if (b.every(Boolean)) return { player: \"draw\" };
+  return null;
+};
+
+const aiMove = (board) => {
+  // Try win, then block, else center, else random
+  const tryWin = (mark) => {
+    for (let i = 0; i < 9; i++) {
+      if (!board[i]) {
+        const b = [...board];
+        b[i] = mark;
+        if (winnerOf(b)?.player === mark) return i;
+      }
+    }
+    return -1;
+  };
+  let m = tryWin(\"O\");
+  if (m >= 0) return m;
+  m = tryWin(\"X\");
+  if (m >= 0) return m;
+  if (!board[4]) return 4;
+  const empty = board.map((v, i) => (v ? -1 : i)).filter((v) => v >= 0);
+  return empty[Math.floor(Math.random() * empty.length)];
+};
+
+const TicTacToe = ({ onScoreSubmitted }) => {
+  const { user } = useAuth();
+  const [board, setBoard] = useState(Array(9).fill(null));
+  const [turn, setTurn] = useState(\"X\");
+  const [wins, setWins] = useState(0);
+  const [result, setResult] = useState(null);
+  const { submit, submitting } = useScoreSubmit(\"tic-tac-toe\", onScoreSubmitted);
+
+  const w = winnerOf(board);
+
+  useEffect(() => {
+    if (!w && turn === \"O\") {
+      const t = setTimeout(() => {
+        setBoard((b) => {
+          const nb = [...b];
+          const m = aiMove(nb);
+          if (m >= 0) nb[m] = \"O\";
+          return nb;
+        });
+        setTurn(\"X\");
+      }, 380);
+      return () => clearTimeout(t);
+    }
+    if (w && !result) {
+      setResult(w);
+      if (w.player === \"X\") setWins((x) => x + 1);
+    }
+  }, [board, turn, w, result]);
+
+  const click = (i) => {
+    if (board[i] || w || turn !== \"X\") return;
+    const nb = [...board];
+    nb[i] = \"X\";
+    setBoard(nb);
+    setTurn(\"O\");
+  };
+
+  const reset = () => {
+    setBoard(Array(9).fill(null));
+    setTurn(\"X\");
+    setResult(null);
+  };
+
+  return (
+    <div className=\"space-y-6\">
+      <div className=\"flex items-center justify-between text-sm\">
+        <div>You: <span className=\"neon-text-cyan font-bold\">X</span> · AI: <span className=\"neon-text-yellow font-bold\">O</span></div>
+        <div data-testid=\"ttt-wins\">Wins: <span className=\"text-[#00FF41] font-mono\">{wins}</span></div>
+      </div>
+
+      <div className=\"grid grid-cols-3 gap-2 max-w-[420px] mx-auto\">
+        {board.map((cell, i) => (
+          <button
+            key={i}
+            data-testid={`ttt-cell-${i}`}
+            onClick={() => click(i)}
+            className={`aspect-square card-neon flex items-center justify-center text-5xl font-heading font-black ${
+              w?.line?.includes(i) ? \"border-[#00FF41] text-[#00FF41] glow-green\" : \"\"
+            } ${cell === \"X\" ? \"text-[#00F0FF]\" : cell === \"O\" ? \"text-[#FEE715]\" : \"\"}`}
+          >
+            {cell}
+          </button>
+        ))}
+      </div>
+
+      <div className=\"text-center\">
+        {result && (
+          <div data-testid=\"ttt-result\" className=\"mb-4 font-heading text-xl\">
+            {result.player === \"draw\"
+              ? \"DRAW.\"
+              : result.player === \"X\"
+              ? \"VICTORY.\"
+              : \"DEFEATED.\"}
+          </div>
+        )}
+        <div className=\"flex justify-center gap-3\">
+          <button data-testid=\"ttt-reset\" onClick={reset} className=\"btn-outline-cyan\">New Round</button>
+          {user && user !== false && wins > 0 && (
+            <button
+              data-testid=\"ttt-submit\"
+              onClick={() => submit(wins)}
+              disabled={submitting}
+              className=\"btn-primary\"
+            >
+              Submit {wins} Win{wins === 1 ? \"\" : \"s\"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default TicTacToe;
+"
+Observation: Create successful: /app/frontend/src/games/TicTacToe.jsx
+
+Action: file_editor create /app/frontend/src/games/Snake.jsx --file-text "import { useEffect, useRef, useState, useCallback } from \"react\";
+import { useScoreSubmit } from \"./_scoreUtils\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const GRID = 20;
+const CELL = 18;
+
+const Snake = ({ onScoreSubmitted }) => {
+  const { user } = useAuth();
+  const [snake, setSnake] = useState([{ x: 10, y: 10 }]);
+  const [dir, setDir] = useState({ x: 1, y: 0 });
+  const [food, setFood] = useState({ x: 5, y: 5 });
+  const [dead, setDead] = useState(false);
+  const [running, setRunning] = useState(false);
+  const dirRef = useRef(dir);
+  const { submit, submitting } = useScoreSubmit(\"snake\", onScoreSubmitted);
+
+  const score = snake.length - 1;
+
+  const placeFood = useCallback((snk) => {
+    while (true) {
+      const f = { x: Math.floor(Math.random() * GRID), y: Math.floor(Math.random() * GRID) };
+      if (!snk.some((s) => s.x === f.x && s.y === f.y)) return f;
+    }
+  }, []);
+
+  const reset = () => {
+    const s = [{ x: 10, y: 10 }];
+    setSnake(s);
+    setDir({ x: 1, y: 0 });
+    dirRef.current = { x: 1, y: 0 };
+    setFood(placeFood(s));
+    setDead(false);
+    setRunning(true);
+  };
+
+  useEffect(() => {
+    const onKey = (e) => {
+      const map = {
+        ArrowUp: { x: 0, y: -1 }, w: { x: 0, y: -1 }, W: { x: 0, y: -1 },
+        ArrowDown: { x: 0, y: 1 }, s: { x: 0, y: 1 }, S: { x: 0, y: 1 },
+        ArrowLeft: { x: -1, y: 0 }, a: { x: -1, y: 0 }, A: { x: -1, y: 0 },
+        ArrowRight: { x: 1, y: 0 }, d: { x: 1, y: 0 }, D: { x: 1, y: 0 },
+      };
+      const nd = map[e.key];
+      if (!nd) return;
+      const cur = dirRef.current;
+      if (nd.x === -cur.x && nd.y === -cur.y) return;
+      dirRef.current = nd;
+      setDir(nd);
+      if ([\"ArrowUp\", \"ArrowDown\", \"ArrowLeft\", \"ArrowRight\"].includes(e.key)) e.preventDefault();
+    };
+    window.addEventListener(\"keydown\", onKey);
+    return () => window.removeEventListener(\"keydown\", onKey);
+  }, []);
+
+  useEffect(() => {
+    if (!running || dead) return;
+    const t = setInterval(() => {
+      setSnake((s) => {
+        const head = { x: s[0].x + dirRef.current.x, y: s[0].y + dirRef.current.y };
+        if (head.x < 0 || head.y < 0 || head.x >= GRID || head.y >= GRID || s.some((p) => p.x === head.x && p.y === head.y)) {
+          setDead(true);
+          setRunning(false);
+          return s;
+        }
+        const ate = head.x === food.x && head.y === food.y;
+        const ns = [head, ...s];
+        if (!ate) ns.pop();
+        else setFood(placeFood(ns));
+        return ns;
+      });
+    }, 120);
+    return () => clearInterval(t);
+  }, [running, dead, food, placeFood]);
+
+  return (
+    <div className=\"space-y-4\">
+      <div className=\"flex items-center justify-between text-sm\">
+        <div>Use <span className=\"text-[#00F0FF]\">WASD</span> or arrows</div>
+        <div data-testid=\"snake-score\">Length: <span className=\"text-[#00FF41] font-mono\">{score}</span></div>
+      </div>
+
+      <div
+        className=\"card-neon p-2 mx-auto relative\"
+        style={{ width: GRID * CELL + 16, height: GRID * CELL + 16 }}
+        data-testid=\"snake-board\"
+      >
+        <div className=\"grid-bg absolute inset-2 opacity-50\" />
+        <div className=\"relative\" style={{ width: GRID * CELL, height: GRID * CELL }}>
+          {snake.map((s, i) => (
+            <div
+              key={i}
+              className=\"absolute\"
+              style={{
+                left: s.x * CELL,
+                top: s.y * CELL,
+                width: CELL - 2,
+                height: CELL - 2,
+                background: i === 0 ? \"#00FF41\" : \"#0bb83a\",
+                boxShadow: i === 0 ? \"0 0 12px rgba(0,255,65,0.7)\" : undefined,
+              }}
+            />
+          ))}
+          <div
+            className=\"absolute\"
+            style={{
+              left: food.x * CELL,
+              top: food.y * CELL,
+              width: CELL - 2,
+              height: CELL - 2,
+              background: \"#FEE715\",
+              boxShadow: \"0 0 12px rgba(254,231,21,0.8)\",
+            }}
+          />
+        </div>
+      </div>
+
+      <div className=\"flex justify-center gap-3\">
+        {!running && (
+          <button data-testid=\"snake-start\" onClick={reset} className=\"btn-primary\">
+            {dead ? \"Restart\" : \"Start\"}
+          </button>
+        )}
+        {dead && user && user !== false && score > 0 && (
+          <button
+            data-testid=\"snake-submit\"
+            onClick={() => submit(score)}
+            disabled={submitting}
+            className=\"btn-outline-cyan\"
+          >
+            Submit {score}
+          </button>
+        )}
+      </div>
+
+      {dead && <div className=\"text-center text-red-400 font-heading text-xl\" data-testid=\"snake-dead\">GAME OVER</div>}
+    </div>
+  );
+};
+
+export default Snake;
+"
+Observation: Create successful: /app/frontend/src/games/Snake.jsx
+
+Action: file_editor create /app/frontend/src/games/Memory.jsx --file-text "import { useEffect, useState } from \"react\";
+import { useScoreSubmit } from \"./_scoreUtils\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const ICONS = [\"▲\", \"◆\", \"■\", \"●\", \"★\", \"✦\", \"⬡\", \"✚\"];
+
+const makeDeck = () => {
+  const pairs = [...ICONS, ...ICONS];
+  for (let i = pairs.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pairs[i], pairs[j]] = [pairs[j], pairs[i]];
+  }
+  return pairs.map((icon, i) => ({ id: i, icon, flipped: false, matched: false }));
+};
+
+const Memory = ({ onScoreSubmitted }) => {
+  const { user } = useAuth();
+  const [cards, setCards] = useState(makeDeck());
+  const [picks, setPicks] = useState([]);
+  const [moves, setMoves] = useState(0);
+  const [done, setDone] = useState(false);
+  const { submit, submitting } = useScoreSubmit(\"memory\", onScoreSubmitted);
+
+  const score = done ? Math.max(0, 200 - moves * 5) : 0;
+
+  useEffect(() => {
+    if (cards.every((c) => c.matched)) setDone(true);
+  }, [cards]);
+
+  useEffect(() => {
+    if (picks.length === 2) {
+      const [a, b] = picks;
+      setMoves((m) => m + 1);
+      if (cards[a].icon === cards[b].icon) {
+        setTimeout(() => {
+          setCards((c) => c.map((card, i) => (i === a || i === b ? { ...card, matched: true } : card)));
+          setPicks([]);
+        }, 360);
+      } else {
+        setTimeout(() => {
+          setCards((c) => c.map((card, i) => (i === a || i === b ? { ...card, flipped: false } : card)));
+          setPicks([]);
+        }, 700);
+      }
+    }
+  }, [picks, cards]);
+
+  const click = (i) => {
+    if (picks.length === 2 || cards[i].flipped || cards[i].matched) return;
+    setCards((c) => c.map((card, idx) => (idx === i ? { ...card, flipped: true } : card)));
+    setPicks((p) => [...p, i]);
+  };
+
+  const reset = () => {
+    setCards(makeDeck());
+    setPicks([]);
+    setMoves(0);
+    setDone(false);
+  };
+
+  return (
+    <div className=\"space-y-4\">
+      <div className=\"flex justify-between text-sm\">
+        <div>Moves: <span data-testid=\"memory-moves\" className=\"text-[#00F0FF] font-mono\">{moves}</span></div>
+        {done && <div data-testid=\"memory-score\" className=\"text-[#00FF41]\">Score: <span className=\"font-mono\">{score}</span></div>}
+      </div>
+
+      <div className=\"grid grid-cols-4 gap-2 max-w-[420px] mx-auto\" data-testid=\"memory-board\">
+        {cards.map((c, i) => (
+          <button
+            key={c.id}
+            data-testid={`memory-card-${i}`}
+            onClick={() => click(i)}
+            className={`aspect-square card-neon flex items-center justify-center text-3xl font-heading transition-all ${
+              c.matched ? \"border-[#00FF41] text-[#00FF41]\" : c.flipped ? \"border-[#00F0FF] text-[#00F0FF]\" : \"text-transparent\"
+            }`}
+          >
+            {c.flipped || c.matched ? c.icon : \"?\"}
+          </button>
+        ))}
+      </div>
+
+      <div className=\"flex justify-center gap-3\">
+        <button data-testid=\"memory-reset\" onClick={reset} className=\"btn-outline-cyan\">Reset</button>
+        {done && user && user !== false && (
+          <button data-testid=\"memory-submit\" onClick={() => submit(score)} disabled={submitting} className=\"btn-primary\">
+            Submit {score}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default Memory;
+"
+Observation: Create successful: /app/frontend/src/games/Memory.jsx
+
+Action: file_editor create /app/frontend/src/games/Game2048.jsx --file-text "import { useEffect, useState, useRef } from \"react\";
+import { useScoreSubmit } from \"./_scoreUtils\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const SIZE = 4;
+const empty = () => Array(SIZE * SIZE).fill(0);
+
+const addTile = (grid) => {
+  const empties = grid.map((v, i) => (v === 0 ? i : -1)).filter((i) => i >= 0);
+  if (empties.length === 0) return grid;
+  const i = empties[Math.floor(Math.random() * empties.length)];
+  const g = [...grid];
+  g[i] = Math.random() < 0.9 ? 2 : 4;
+  return g;
+};
+
+const rotate = (grid) => {
+  // rotate 90° clockwise
+  const n = Array(SIZE * SIZE).fill(0);
+  for (let r = 0; r < SIZE; r++) for (let c = 0; c < SIZE; c++) n[c * SIZE + (SIZE - 1 - r)] = grid[r * SIZE + c];
+  return n;
+};
+
+const slideRow = (row) => {
+  const filtered = row.filter((v) => v !== 0);
+  const out = [];
+  let gained = 0;
+  let i = 0;
+  while (i < filtered.length) {
+    if (filtered[i] === filtered[i + 1]) {
+      out.push(filtered[i] * 2);
+      gained += filtered[i] * 2;
+      i += 2;
+    } else {
+      out.push(filtered[i]);
+      i += 1;
+    }
+  }
+  while (out.length < SIZE) out.push(0);
+  return { row: out, gained };
+};
+
+const moveLeft = (grid) => {
+  let gained = 0;
+  const next = [];
+  for (let r = 0; r < SIZE; r++) {
+    const { row, gained: g } = slideRow(grid.slice(r * SIZE, r * SIZE + SIZE));
+    gained += g;
+    next.push(...row);
+  }
+  return { grid: next, gained, changed: next.some((v, i) => v !== grid[i]) };
+};
+
+const move = (grid, dir) => {
+  // dir: 0=left, 1=up, 2=right, 3=down. Use rotation strategy.
+  let g = grid;
+  for (let i = 0; i < dir; i++) g = rotate(g);
+  const res = moveLeft(g);
+  let n = res.grid;
+  for (let i = 0; i < (4 - dir) % 4; i++) n = rotate(n);
+  return { grid: n, gained: res.gained, changed: res.changed };
+};
+
+const canMove = (g) => {
+  if (g.some((v) => v === 0)) return true;
+  for (let r = 0; r < SIZE; r++)
+    for (let c = 0; c < SIZE; c++) {
+      const v = g[r * SIZE + c];
+      if (c + 1 < SIZE && g[r * SIZE + c + 1] === v) return true;
+      if (r + 1 < SIZE && g[(r + 1) * SIZE + c] === v) return true;
+    }
+  return false;
+};
+
+const COLORS = {
+  0: \"bg-[#0C0C0E] text-transparent\",
+  2: \"bg-[#15202B] text-zinc-300\",
+  4: \"bg-[#1E2D3D] text-zinc-200\",
+  8: \"bg-[#22484F] text-[#00F0FF]\",
+  16: \"bg-[#005f6b] text-white\",
+  32: \"bg-[#00808a] text-white\",
+  64: \"bg-[#00aaba] text-black\",
+  128: \"bg-[#FEE715] text-black\",
+  256: \"bg-[#FFCD15] text-black\",
+  512: \"bg-[#FFA700] text-black\",
+  1024: \"bg-[#FF7700] text-black\",
+  2048: \"bg-[#00FF41] text-black\",
+};
+
+const Game2048 = ({ onScoreSubmitted }) => {
+  const { user } = useAuth();
+  const [grid, setGrid] = useState(() => addTile(addTile(empty())));
+  const [score, setScore] = useState(0);
+  const [dead, setDead] = useState(false);
+  const stateRef = useRef({ grid, score, dead });
+  stateRef.current = { grid, score, dead };
+  const { submit, submitting } = useScoreSubmit(\"2048\", onScoreSubmitted);
+
+  const reset = () => {
+    setGrid(addTile(addTile(empty())));
+    setScore(0);
+    setDead(false);
+  };
+
+  useEffect(() => {
+    const onKey = (e) => {
+      const map = { ArrowLeft: 0, ArrowUp: 1, ArrowRight: 2, ArrowDown: 3, a: 0, w: 1, d: 2, s: 3 };
+      const dir = map[e.key];
+      if (dir === undefined || stateRef.current.dead) return;
+      e.preventDefault();
+      const { grid: ng, gained, changed } = move(stateRef.current.grid, dir);
+      if (!changed) return;
+      const withTile = addTile(ng);
+      setGrid(withTile);
+      setScore((s) => s + gained);
+      if (!canMove(withTile)) setDead(true);
+    };
+    window.addEventListener(\"keydown\", onKey);
+    return () => window.removeEventListener(\"keydown\", onKey);
+  }, []);
+
+  return (
+    <div className=\"space-y-4\">
+      <div className=\"flex justify-between text-sm\">
+        <div>Arrows / WASD</div>
+        <div>Score: <span data-testid=\"g2048-score\" className=\"text-[#FEE715] font-mono\">{score}</span></div>
+      </div>
+
+      <div className=\"grid grid-cols-4 gap-2 max-w-[420px] mx-auto card-neon p-2\" data-testid=\"g2048-board\">
+        {grid.map((v, i) => (
+          <div
+            key={i}
+            className={`aspect-square flex items-center justify-center font-heading font-black text-2xl ${COLORS[v] || \"bg-[#FF4444] text-black\"}`}
+          >
+            {v || \"\"}
+          </div>
+        ))}
+      </div>
+
+      <div className=\"flex justify-center gap-3\">
+        <button data-testid=\"g2048-reset\" onClick={reset} className=\"btn-outline-cyan\">New Game</button>
+        {(dead || score > 0) && user && user !== false && (
+          <button data-testid=\"g2048-submit\" onClick={() => submit(score)} disabled={submitting} className=\"btn-primary\">
+            Submit {score}
+          </button>
+        )}
+      </div>
+
+      {dead && <div className=\"text-center text-red-400 font-heading text-xl\" data-testid=\"g2048-dead\">GAME OVER</div>}
+    </div>
+  );
+};
+
+export default Game2048;
+"
+Observation: Create successful: /app/frontend/src/games/Game2048.jsx
+
+Action: file_editor create /app/frontend/src/games/RPS.jsx --file-text "import { useState } from \"react\";
+import { useScoreSubmit } from \"./_scoreUtils\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const CHOICES = [
+  { id: \"rock\", label: \"Rock\", icon: \"✊\" },
+  { id: \"paper\", label: \"Paper\", icon: \"✋\" },
+  { id: \"scissors\", label: \"Scissors\", icon: \"✌\" },
+];
+
+const WINS = { rock: \"scissors\", paper: \"rock\", scissors: \"paper\" };
+
+const RPS = ({ onScoreSubmitted }) => {
+  const { user } = useAuth();
+  const [streak, setStreak] = useState(0);
+  const [best, setBest] = useState(0);
+  const [you, setYou] = useState(null);
+  const [ai, setAi] = useState(null);
+  const [result, setResult] = useState(null);
+  const { submit, submitting } = useScoreSubmit(\"rps\", onScoreSubmitted);
+
+  const play = (choice) => {
+    const aiPick = CHOICES[Math.floor(Math.random() * 3)].id;
+    setYou(choice);
+    setAi(aiPick);
+    if (choice === aiPick) {
+      setResult(\"draw\");
+    } else if (WINS[choice] === aiPick) {
+      setResult(\"win\");
+      setStreak((s) => {
+        const ns = s + 1;
+        setBest((b) => Math.max(b, ns));
+        return ns;
+      });
+    } else {
+      setResult(\"lose\");
+      setStreak(0);
+    }
+  };
+
+  const icon = (id) => CHOICES.find((c) => c.id === id)?.icon;
+
+  return (
+    <div className=\"space-y-6\">
+      <div className=\"flex justify-between text-sm\">
+        <div>Streak: <span data-testid=\"rps-streak\" className=\"text-[#00FF41] font-mono\">{streak}</span></div>
+        <div>Best: <span data-testid=\"rps-best\" className=\"text-[#FEE715] font-mono\">{best}</span></div>
+      </div>
+
+      <div className=\"grid grid-cols-2 gap-6 max-w-md mx-auto\">
+        <div className=\"card-neon p-6 text-center\">
+          <div className=\"label-neon mb-2\">YOU</div>
+          <div className=\"text-6xl\">{you ? icon(you) : \"·\"}</div>
+        </div>
+        <div className=\"card-neon p-6 text-center\">
+          <div className=\"label-neon mb-2\">AI</div>
+          <div className=\"text-6xl\">{ai ? icon(ai) : \"·\"}</div>
+        </div>
+      </div>
+
+      {result && (
+        <div
+          data-testid=\"rps-result\"
+          className={`text-center font-heading font-black text-2xl ${
+            result === \"win\" ? \"neon-text-green\" : result === \"draw\" ? \"text-zinc-300\" : \"text-red-400\"
+          }`}
+        >
+          {result === \"win\" ? \"VICTORY.\" : result === \"draw\" ? \"DRAW.\" : \"DEFEATED.\"}
+        </div>
+      )}
+
+      <div className=\"flex justify-center gap-3\">
+        {CHOICES.map((c) => (
+          <button
+            key={c.id}
+            data-testid={`rps-${c.id}`}
+            onClick={() => play(c.id)}
+            className=\"btn-outline-cyan text-2xl px-6 py-4\"
+            aria-label={c.label}
+          >
+            {c.icon}
+          </button>
+        ))}
+      </div>
+
+      <div className=\"flex justify-center\">
+        {user && user !== false && best > 0 && (
+          <button
+            data-testid=\"rps-submit\"
+            onClick={() => submit(best)}
+            disabled={submitting}
+            className=\"btn-primary\"
+          >
+            Submit Best Streak: {best}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default RPS;
+"
+Observation: Create successful: /app/frontend/src/games/RPS.jsx
+
+Action: file_editor create /app/frontend/src/games/Reaction.jsx --file-text "import { useState, useRef } from \"react\";
+import { useScoreSubmit } from \"./_scoreUtils\";
+import { useAuth } from \"../contexts/AuthContext\";
+
+const Reaction = ({ onScoreSubmitted }) => {
+  const { user } = useAuth();
+  const [state, setState] = useState(\"idle\"); // idle | waiting | ready | done | tooEarly
+  const [ms, setMs] = useState(null);
+  const [best, setBest] = useState(null);
+  const timerRef = useRef(null);
+  const startedAt = useRef(0);
+  const { submit, submitting } = useScoreSubmit(\"reaction\", onScoreSubmitted);
+
+  const begin = () => {
+    setMs(null);
+    setState(\"waiting\");
+    const wait = 1200 + Math.random() * 2200;
+    timerRef.current = setTimeout(() => {
+      startedAt.current = performance.now();
+      setState(\"ready\");
+    }, wait);
+  };
+
+  const click = () => {
+    if (state === \"idle\" || state === \"done\" || state === \"tooEarly\") {
+      begin();
+    } else if (state === \"waiting\") {
+      clearTimeout(timerRef.current);
+      setState(\"tooEarly\");
+    } else if (state === \"ready\") {
+      const took = Math.round(performance.now() - startedAt.current);
+      setMs(took);
+      setBest((b) => (b === null ? took : Math.min(b, took)));
+      setState(\"done\");
+    }
+  };
+
+  const bg =
+    state === \"waiting\"
+      ? \"bg-[#FEE715] text-black\"
+      : state === \"ready\"
+      ? \"bg-[#00FF41] text-black\"
+      : state === \"tooEarly\"
+      ? \"bg-red-500 text-black\"
+      : \"bg-[#0C0C0E] text-white border border-[#1F2937]\";
+
+  const label =
+    state === \"idle\"
+      ? \"Click to start\"
+      : state === \"waiting\"
+      ? \"Wait for GREEN…\"
+      : state === \"ready\"
+      ? \"CLICK NOW!\"
+      : state === \"tooEarly\"
+      ? \"Too early. Click to retry.\"
+      : `${ms} ms · click for another`;
+
+  return (
+    <div className=\"space-y-4\">
+      <div className=\"flex justify-between text-sm\">
+        <div>Last: <span data-testid=\"reaction-last\" className=\"text-[#00F0FF] font-mono\">{ms ?? \"—\"} ms</span></div>
+        <div>Best: <span data-testid=\"reaction-best\" className=\"text-[#FEE715] font-mono\">{best ?? \"—\"} ms</span></div>
+      </div>
+
+      <button
+        data-testid=\"reaction-area\"
+        onClick={click}
+        className={`w-full h-72 flex items-center justify-center font-heading font-black text-3xl transition-colors ${bg}`}
+      >
+        {label}
+      </button>
+
+      <div className=\"flex justify-center\">
+        {best !== null && user && user !== false && (
+          <button
+            data-testid=\"reaction-submit\"
+            onClick={() => submit(best)}
+            disabled={submitting}
+            className=\"btn-primary\"
+          >
+            Submit Best: {best} ms
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default Reaction;
+"
+Observation: Create successful: /app/frontend/src/games/Reaction.jsx
